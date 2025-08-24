@@ -11,10 +11,14 @@ from discord.ext import commands
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 # 公開URLなら https://xxx.up.railway.app （ポートなし）
 # Private DNS を使うなら http://<service>.railway.internal:50021
-VOICEVOX_URL  = os.getenv("VOICEVOX_URL", "https://example.up.railway.app")
+VOICEVOX_URL = os.getenv("VOICEVOX_URL", "https://example.up.railway.app")
 
-# しゃきぴよ風（高め・元気・やや早口）
-DEFAULT_PARAMS = dict(
+# デフォルト話者・スタイル（必要に応じて Variables で上書き）
+DEFAULT_SPEAKER_NAME = os.getenv("VV_SPEAKER_NAME", "春日部つむぎ")
+DEFAULT_STYLE_NAME   = os.getenv("VV_STYLE_NAME", "ノーマル")
+
+# しゃきぴよ風プリセット（/vv reset 用）
+SHAKIPIYO_PARAMS = dict(
     speedScale=1.15,
     pitchScale=0.60,
     intonationScale=1.20,
@@ -22,8 +26,16 @@ DEFAULT_PARAMS = dict(
     prePhonemeLength=0.1,
     postPhonemeLength=0.1,
 )
-DEFAULT_SPEAKER_NAME = os.getenv("VV_SPEAKER_NAME", "春日部つむぎ")
-DEFAULT_STYLE_NAME   = os.getenv("VV_STYLE_NAME", "ノーマル")
+
+# 起動時の通常値（素の声にしたい時はここを 1.0/0.0/1.0 に）
+DEFAULT_PARAMS = dict(
+    speedScale=1.0,
+    pitchScale=0.0,
+    intonationScale=1.0,
+    volumeScale=1.0,
+    prePhonemeLength=0.1,
+    postPhonemeLength=0.1,
+)
 
 # 即時同期ギルド（カンマ区切り、未設定ならグローバル同期）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
@@ -34,7 +46,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# VCごとの再生キュー & タスク
+# 再生キュー & タスク（ギルドごと）
 voice_queues: dict[int, asyncio.Queue[bytes]] = {}
 player_tasks: dict[int, asyncio.Task] = {}
 
@@ -44,10 +56,10 @@ current_speaker_name = DEFAULT_SPEAKER_NAME
 current_style_name   = DEFAULT_STYLE_NAME
 
 
-# ========= セッション（IPv4強制。Private DNS が IPv6 しか返すなら公開URL https を推奨） =========
+# ========= セッション（IPv4固定。Private DNS が IPv6-only なら公開URL https を推奨） =========
 def _make_session() -> aiohttp.ClientSession:
     return aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(family=socket.AF_INET)  # IPv4固定
+        connector=aiohttp.TCPConnector(family=socket.AF_INET)  # IPv4のみ
     )
 
 
@@ -68,7 +80,7 @@ async def synth_voicevox(text: str) -> bytes:
         spk_id = await resolve_speaker(session, current_speaker_name, current_style_name)
 
         # --- audio_query ---
-        # 1st: 正式仕様（POST + クエリに text/speaker）
+        # 1st: 公式仕様（POST + クエリに text/speaker）
         async with session.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"text": text, "speaker": spk_id},
@@ -77,7 +89,7 @@ async def synth_voicevox(text: str) -> bytes:
                 query = await r.json()
             else:
                 body = await r.text()
-                # 405/415/422 などの場合のみ json ボディ方式でフォールバック
+                # 405/415/422 の場合のみ json ボディ方式でフォールバック
                 if r.status in (405, 415, 422):
                     async with session.post(
                         f"{VOICEVOX_URL}/audio_query",
@@ -92,7 +104,7 @@ async def synth_voicevox(text: str) -> bytes:
                 else:
                     raise RuntimeError(f"audio_query {r.status}: {body}")
 
-        # しゃきぴよ風パラメータ反映
+        # パラメータ反映（現在値）
         for k, v in current_params.items():
             query[k] = v
 
@@ -109,7 +121,7 @@ async def synth_voicevox(text: str) -> bytes:
             return await r.read()  # wav bytes
 
 
-# ========= 再生ループ =========
+# ========= 再生ループ（/tmp・Opus出力・クリーンアップ・競合回避） =========
 async def ensure_player(vc: discord.VoiceClient):
     gid = vc.guild.id
     if gid in player_tasks and not player_tasks[gid].done():
@@ -122,42 +134,87 @@ async def ensure_player(vc: discord.VoiceClient):
             while vc.is_connected():
                 data = await voice_queues[gid].get()
 
-                # すでに再生中なら終わるまで待機（保険）
+                # すでに再生中なら終了を待つ（競合回避）
                 while vc.is_playing():
                     await asyncio.sleep(0.1)
 
-                # /tmp に一時wavを出力（Railwayでも安全）
-                tmp = f"/tmp/vv_{gid}_{asyncio.get_event_loop().time():.0f}.wav"
+                # /tmp に一時wavを作成
+                tmp = f"/tmp/vv_{gid}_{int(asyncio.get_event_loop().time())}.wav"
                 with open(tmp, "wb") as f:
                     f.write(data)
 
-                # FFmpeg → Opus で出す方が安定＆低負荷
-                # ※ ffmpeg が必要。NIXPACKS_PKGS=ffmpeg libopus を設定済みに
-                source = discord.FFmpegOpusAudio(tmp)  # そのままOpusストリームへ
-
-                done = asyncio.Event()
+                # FFmpeg -> Opus でDiscordへ（軽量・安定）
+                source = discord.FFmpegOpusAudio(tmp)
+                done_evt = asyncio.Event()
 
                 def _after(_err):
                     try:
-                        # FFmpegプロセスを確実に掃除
                         if hasattr(source, "cleanup"):
                             source.cleanup()
                     finally:
-                        # 一時ファイル削除
                         try:
-                            import os
                             os.remove(tmp)
                         except Exception:
                             pass
-                        done.set()
+                        done_evt.set()
 
                 vc.play(source, after=_after)
-                await done.wait()
+                await done_evt.wait()
 
         except Exception as e:
             print("[player_loop]", e)
 
     player_tasks[gid] = asyncio.create_task(_loop())
+
+
+# ========= 安全なVC接続（4006対策：移動優先・リトライ） =========
+async def safe_connect_to_user_channel(interaction: discord.Interaction, max_attempts: int = 3):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("先にVCへ入室してください。", ephemeral=True)
+        return None
+
+    target = interaction.user.voice.channel
+    vc = interaction.guild.voice_client
+
+    # 既に同じVC
+    if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"🔊 既に {target.mention} に接続済みです。", ephemeral=True)
+        return vc
+
+    # 別VCにいるなら move_to を優先
+    if vc and vc.is_connected() and vc.channel and vc.channel.id != target.id:
+        try:
+            await vc.move_to(target)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"↪️ {target.mention} に移動しました。")
+            return vc
+        except Exception:
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+
+    # 新規接続（4006 などはリトライ）
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            vc = await target.connect(timeout=8.0, reconnect=False)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"🔊 {target.mention} に接続しました。")
+            return vc
+        except (discord.errors.ConnectionClosed, asyncio.TimeoutError) as e:
+            last_err = e
+            await asyncio.sleep(1.5 * attempt)
+        except Exception as e:
+            last_err = e
+            break
+
+    if not interaction.response.is_done():
+        await interaction.response.send_message(f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}", ephemeral=True)
+    return None
+
 
 # ========= スラッシュコマンド =========
 @bot.event
@@ -198,13 +255,9 @@ async def sync_here(interaction: discord.Interaction):
 @tree.command(name="join", description="あなたのいるVCに参加します。")
 @app_commands.checks.bot_has_permissions(connect=True, speak=True)
 async def join_cmd(interaction: discord.Interaction):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        return await interaction.response.send_message("先にVCへ入室してください。", ephemeral=True)
-    if interaction.guild.voice_client and interaction.guild.voice_client.is_connected():
-        return await interaction.response.send_message("すでに接続済みです。", ephemeral=True)
-    vc = await interaction.user.voice.channel.connect()
-    await ensure_player(vc)
-    await interaction.response.send_message(f"🔊 {vc.channel.mention} に接続しました。")
+    vc = await safe_connect_to_user_channel(interaction)
+    if vc:
+        await ensure_player(vc)
 
 
 @tree.command(name="leave", description="VCから退出します。")
@@ -212,8 +265,11 @@ async def leave_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc:
         return await interaction.response.send_message("未接続です。", ephemeral=True)
-    await vc.disconnect()
-    await interaction.response.send_message("👋 切断しました。")
+    try:
+        await vc.disconnect(force=True)
+    finally:
+        await interaction.response.send_message("👋 切断しました。")
+        await asyncio.sleep(0.8)  # セッション解放猶予
 
 
 @tree.command(name="say", description="テキストを読み上げます。")
@@ -229,7 +285,7 @@ async def say_cmd(interaction: discord.Interaction, text: str):
     await interaction.followup.send("📣 キューに追加しました。", ephemeral=True)
 
 
-# VOICEVOX設定
+# VOICEVOX設定グループ
 vv_group = app_commands.Group(name="vv", description="VOICEVOX設定")
 
 @vv_group.command(name="voice", description="話者/スタイルを切替（例: 春日部つむぎ ノーマル）")
@@ -255,10 +311,10 @@ async def vv_intonation(interaction: discord.Interaction, value: app_commands.Ra
     current_params["intonationScale"] = float(value)
     await interaction.response.send_message(f"📈 intonation = {current_params['intonationScale']}")
 
-@vv_group.command(name="reset", description="しゃきぴよ風プリセットに戻します。")
+@vv_group.command(name="reset", description="しゃきぴよ風プリセットにリセット")
 async def vv_reset(interaction: discord.Interaction):
     global current_params
-    current_params = DEFAULT_PARAMS.copy()
+    current_params = SHAKIPIYO_PARAMS.copy()
     await interaction.response.send_message("♻️ パラメータをリセットしました（しゃきぴよ風）。")
 
 tree.add_command(vv_group)
@@ -273,4 +329,3 @@ async def credit_cmd(interaction: discord.Interaction):
 if not DISCORD_TOKEN:
     raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
 bot.run(DISCORD_TOKEN)
-
