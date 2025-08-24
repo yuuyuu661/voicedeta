@@ -9,9 +9,11 @@ from discord.ext import commands
 
 # ====== 環境変数 ======
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-VOICEVOX_URL  = os.getenv("VOICEVOX_URL", "http://voicevox_engine.railway.internal:50021")
+# 公開URLなら https://xxx.up.railway.app （ポートなし）
+# Private DNS を使うなら http://<service>.railway.internal:50021
+VOICEVOX_URL  = os.getenv("VOICEVOX_URL", "https://example.up.railway.app")
 
-# 高め・元気・やや早口（しゃきぴよ風）
+# しゃきぴよ風（高め・元気・やや早口）
 DEFAULT_PARAMS = dict(
     speedScale=1.15,
     pitchScale=0.60,
@@ -23,7 +25,7 @@ DEFAULT_PARAMS = dict(
 DEFAULT_SPEAKER_NAME = os.getenv("VV_SPEAKER_NAME", "春日部つむぎ")
 DEFAULT_STYLE_NAME   = os.getenv("VV_STYLE_NAME", "ノーマル")
 
-# 即時同期したいギルドID（カンマ区切り）。未設定ならグローバル同期。
+# 即時同期ギルド（カンマ区切り、未設定ならグローバル同期）
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
 
 # ====== Bot 準備 ======
@@ -32,21 +34,20 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# 再生キュー（ギルドごと）
+# VCごとの再生キュー & タスク
 voice_queues: dict[int, asyncio.Queue[bytes]] = {}
 player_tasks: dict[int, asyncio.Task] = {}
 
-# 現在のTTS設定（プロセス共通）
+# 現在のTTS設定
 current_params = DEFAULT_PARAMS.copy()
 current_speaker_name = DEFAULT_SPEAKER_NAME
 current_style_name   = DEFAULT_STYLE_NAME
 
 
-# ========= IPv4固定のセッション =========
+# ========= セッション（IPv4強制。Private DNS が IPv6 しか返すなら公開URL https を推奨） =========
 def _make_session() -> aiohttp.ClientSession:
-    # family=AF_INET で IPv4 のみを解決・接続
     return aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(family=socket.AF_INET)
+        connector=aiohttp.TCPConnector(family=socket.AF_INET)  # IPv4固定
     )
 
 
@@ -66,73 +67,85 @@ async def synth_voicevox(text: str) -> bytes:
     async with _make_session() as session:
         spk_id = await resolve_speaker(session, current_speaker_name, current_style_name)
 
-        # ✅ audio_query: JSON で { "text": ... } を送る
+        # --- audio_query ---
+        # 1st: 正式仕様（POST + クエリに text/speaker）
         async with session.post(
             f"{VOICEVOX_URL}/audio_query",
-            params={"speaker": spk_id},
-            json={"text": text},                         # ← ここを data→json に変更
-            headers={"Accept": "application/json"},      # （任意）明示
+            params={"text": text, "speaker": spk_id},
         ) as r:
-            # デバッグしやすいように失敗時は本文を出す
-            if r.status >= 400:
+            if r.status == 200:
+                query = await r.json()
+            else:
                 body = await r.text()
-                raise RuntimeError(f"audio_query {r.status}: {body}")
-            query = await r.json()
+                # 405/415/422 などの場合のみ json ボディ方式でフォールバック
+                if r.status in (405, 415, 422):
+                    async with session.post(
+                        f"{VOICEVOX_URL}/audio_query",
+                        params={"speaker": spk_id},
+                        json={"text": text},
+                        headers={"Accept": "application/json"},
+                    ) as r2:
+                        if r2.status != 200:
+                            body2 = await r2.text()
+                            raise RuntimeError(f"audio_query {r.status}/{r2.status}: {body} // {body2}")
+                        query = await r2.json()
+                else:
+                    raise RuntimeError(f"audio_query {r.status}: {body}")
 
-        # しゃきぴよ風パラメータを上書き
+        # しゃきぴよ風パラメータ反映
         for k, v in current_params.items():
             query[k] = v
 
-        # synthesis は元のまま（JSONで送る）
+        # --- synthesis ---
         async with session.post(
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": spk_id},
             data=json.dumps(query),
             headers={"Content-Type": "application/json"},
         ) as r:
-            if r.status >= 400:
+            if r.status != 200:
                 body = await r.text()
                 raise RuntimeError(f"synthesis {r.status}: {body}")
             return await r.read()  # wav bytes
 
+
 # ========= 再生ループ =========
 async def ensure_player(vc: discord.VoiceClient):
-    g_id = vc.guild.id
-    if g_id in player_tasks and not player_tasks[g_id].done():
+    gid = vc.guild.id
+    if gid in player_tasks and not player_tasks[gid].done():
         return
-
-    if g_id not in voice_queues:
-        voice_queues[g_id] = asyncio.Queue()
+    if gid not in voice_queues:
+        voice_queues[gid] = asyncio.Queue()
 
     async def _loop():
         try:
             while vc.is_connected():
-                data = await voice_queues[g_id].get()
-                tmp = f"vv_{g_id}.wav"
+                data = await voice_queues[gid].get()
+                tmp = f"vv_{gid}.wav"
                 with open(tmp, "wb") as f:
                     f.write(data)
-                # VOICEVOX: 24kHz mono WAV → FFmpeg が48kHz/stereoへ変換
-                source = discord.FFmpegPCMAudio(tmp)
-                done_evt = asyncio.Event()
+                source = discord.FFmpegPCMAudio(tmp)  # FFmpegが48kHz/stereoに変換
+                done = asyncio.Event()
 
                 def _after(_err):
-                    done_evt.set()
+                    done.set()
 
                 vc.play(source, after=_after)
-                await done_evt.wait()
+                await done.wait()
         except Exception as e:
             print("[player_loop]", e)
 
-    player_tasks[g_id] = asyncio.create_task(_loop())
+    player_tasks[gid] = asyncio.create_task(_loop())
 
 
 # ========= スラッシュコマンド =========
 @bot.event
 async def on_ready():
-    # 起動時にVOICEVOX疎通をチェック（IPv4強制で叩く）
+    print(f"Using VOICEVOX_URL={VOICEVOX_URL}")
+    # 起動時疎通チェック
     try:
         async with _make_session() as s:
-            async with s.get(f"{VOICEVOX_URL}/speakers", timeout=5) as r:
+            async with s.get(f"{VOICEVOX_URL}/speakers", timeout=6) as r:
                 r.raise_for_status()
         print(f"VOICEVOX OK: {VOICEVOX_URL}")
     except Exception as e:
@@ -153,8 +166,7 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-# 管理者用：このサーバーに即時同期
-@tree.command(name="sync", description="コマンドをこのサーバーに即時同期（管理者専用）")
+@tree.command(name="sync", description="このサーバーにコマンドを即時同期（管理者専用）")
 async def sync_here(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("管理者のみ実行可です。", ephemeral=True)
@@ -162,7 +174,6 @@ async def sync_here(interaction: discord.Interaction):
     await interaction.response.send_message("✅ このサーバーに同期しました。", ephemeral=True)
 
 
-# /join
 @tree.command(name="join", description="あなたのいるVCに参加します。")
 @app_commands.checks.bot_has_permissions(connect=True, speak=True)
 async def join_cmd(interaction: discord.Interaction):
@@ -170,13 +181,11 @@ async def join_cmd(interaction: discord.Interaction):
         return await interaction.response.send_message("先にVCへ入室してください。", ephemeral=True)
     if interaction.guild.voice_client and interaction.guild.voice_client.is_connected():
         return await interaction.response.send_message("すでに接続済みです。", ephemeral=True)
-
     vc = await interaction.user.voice.channel.connect()
     await ensure_player(vc)
     await interaction.response.send_message(f"🔊 {vc.channel.mention} に接続しました。")
 
 
-# /leave
 @tree.command(name="leave", description="VCから退出します。")
 async def leave_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -186,7 +195,6 @@ async def leave_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("👋 切断しました。")
 
 
-# /say text
 @tree.command(name="say", description="テキストを読み上げます。")
 @app_commands.describe(text="読み上げる内容")
 async def say_cmd(interaction: discord.Interaction, text: str):
@@ -203,7 +211,7 @@ async def say_cmd(interaction: discord.Interaction, text: str):
 # VOICEVOX設定
 vv_group = app_commands.Group(name="vv", description="VOICEVOX設定")
 
-@vv_group.command(name="voice", description="話者/スタイルを切り替えます。例: 春日部つむぎ ノーマル")
+@vv_group.command(name="voice", description="話者/スタイルを切替（例: 春日部つむぎ ノーマル）")
 @app_commands.describe(speaker_name="話者名", style_name="スタイル名")
 async def vv_voice(interaction: discord.Interaction, speaker_name: str, style_name: str):
     global current_speaker_name, current_style_name
@@ -232,18 +240,15 @@ async def vv_reset(interaction: discord.Interaction):
     current_params = DEFAULT_PARAMS.copy()
     await interaction.response.send_message("♻️ パラメータをリセットしました（しゃきぴよ風）。")
 
-# /credit（クレジット表示）
+tree.add_command(vv_group)
+
 @tree.command(name="credit", description="利用中キャラクターのクレジットを表示します。")
 async def credit_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"このBotは VOICEVOX:{current_speaker_name} の音声ライブラリを利用しています。"
     )
 
-# グループ登録
-tree.add_command(vv_group)
-
 # ====== 起動 ======
 if not DISCORD_TOKEN:
     raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
 bot.run(DISCORD_TOKEN)
-
