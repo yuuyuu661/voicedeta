@@ -121,22 +121,43 @@ async def ensure_player(vc: discord.VoiceClient):
         try:
             while vc.is_connected():
                 data = await voice_queues[gid].get()
-                tmp = f"vv_{gid}.wav"
+
+                # すでに再生中なら終わるまで待機（保険）
+                while vc.is_playing():
+                    await asyncio.sleep(0.1)
+
+                # /tmp に一時wavを出力（Railwayでも安全）
+                tmp = f"/tmp/vv_{gid}_{asyncio.get_event_loop().time():.0f}.wav"
                 with open(tmp, "wb") as f:
                     f.write(data)
-                source = discord.FFmpegPCMAudio(tmp)  # FFmpegが48kHz/stereoに変換
+
+                # FFmpeg → Opus で出す方が安定＆低負荷
+                # ※ ffmpeg が必要。NIXPACKS_PKGS=ffmpeg libopus を設定済みに
+                source = discord.FFmpegOpusAudio(tmp)  # そのままOpusストリームへ
+
                 done = asyncio.Event()
 
                 def _after(_err):
-                    done.set()
+                    try:
+                        # FFmpegプロセスを確実に掃除
+                        if hasattr(source, "cleanup"):
+                            source.cleanup()
+                    finally:
+                        # 一時ファイル削除
+                        try:
+                            import os
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+                        done.set()
 
                 vc.play(source, after=_after)
                 await done.wait()
+
         except Exception as e:
             print("[player_loop]", e)
 
     player_tasks[gid] = asyncio.create_task(_loop())
-
 
 # ========= スラッシュコマンド =========
 @bot.event
@@ -252,3 +273,4 @@ async def credit_cmd(interaction: discord.Interaction):
 if not DISCORD_TOKEN:
     raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
 bot.run(DISCORD_TOKEN)
+
