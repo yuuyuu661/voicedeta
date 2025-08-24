@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import socket
 import aiohttp
 import discord
 from discord import app_commands
@@ -41,6 +42,14 @@ current_speaker_name = DEFAULT_SPEAKER_NAME
 current_style_name   = DEFAULT_STYLE_NAME
 
 
+# ========= IPv4固定のセッション =========
+def _make_session() -> aiohttp.ClientSession:
+    # family=AF_INET で IPv4 のみを解決・接続
+    return aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(family=socket.AF_INET)
+    )
+
+
 # ========= VOICEVOX Utility =========
 async def resolve_speaker(session: aiohttp.ClientSession, name: str, style: str) -> int:
     async with session.get(f"{VOICEVOX_URL}/speakers") as r:
@@ -54,8 +63,10 @@ async def resolve_speaker(session: aiohttp.ClientSession, name: str, style: str)
     return speakers[0]["styles"][0]["id"]  # fallback
 
 async def synth_voicevox(text: str) -> bytes:
-    async with aiohttp.ClientSession() as session:
+    async with _make_session() as session:
         spk_id = await resolve_speaker(session, current_speaker_name, current_style_name)
+
+        # audio_query
         async with session.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"speaker": spk_id},
@@ -68,6 +79,7 @@ async def synth_voicevox(text: str) -> bytes:
         for k, v in current_params.items():
             query[k] = v
 
+        # synthesis
         async with session.post(
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": spk_id},
@@ -112,6 +124,16 @@ async def ensure_player(vc: discord.VoiceClient):
 # ========= スラッシュコマンド =========
 @bot.event
 async def on_ready():
+    # 起動時にVOICEVOX疎通をチェック（IPv4強制で叩く）
+    try:
+        async with _make_session() as s:
+            async with s.get(f"{VOICEVOX_URL}/speakers", timeout=5) as r:
+                r.raise_for_status()
+        print(f"VOICEVOX OK: {VOICEVOX_URL}")
+    except Exception as e:
+        print(f"VOICEVOX NG: {VOICEVOX_URL} -> {e}")
+
+    # コマンド同期
     try:
         if GUILD_IDS:
             for gid in GUILD_IDS:
@@ -122,7 +144,9 @@ async def on_ready():
             print("Synced globally")
     except Exception as e:
         print("Sync error:", e)
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
 
 # 管理者用：このサーバーに即時同期
 @tree.command(name="sync", description="コマンドをこのサーバーに即時同期（管理者専用）")
@@ -131,6 +155,7 @@ async def sync_here(interaction: discord.Interaction):
         return await interaction.response.send_message("管理者のみ実行可です。", ephemeral=True)
     await tree.sync(guild=interaction.guild)
     await interaction.response.send_message("✅ このサーバーに同期しました。", ephemeral=True)
+
 
 # /join
 @tree.command(name="join", description="あなたのいるVCに参加します。")
@@ -145,6 +170,7 @@ async def join_cmd(interaction: discord.Interaction):
     await ensure_player(vc)
     await interaction.response.send_message(f"🔊 {vc.channel.mention} に接続しました。")
 
+
 # /leave
 @tree.command(name="leave", description="VCから退出します。")
 async def leave_cmd(interaction: discord.Interaction):
@@ -153,6 +179,7 @@ async def leave_cmd(interaction: discord.Interaction):
         return await interaction.response.send_message("未接続です。", ephemeral=True)
     await vc.disconnect()
     await interaction.response.send_message("👋 切断しました。")
+
 
 # /say text
 @tree.command(name="say", description="テキストを読み上げます。")
@@ -166,6 +193,7 @@ async def say_cmd(interaction: discord.Interaction, text: str):
     audio = await synth_voicevox(text)
     await voice_queues[interaction.guild.id].put(audio)
     await interaction.followup.send("📣 キューに追加しました。", ephemeral=True)
+
 
 # VOICEVOX設定
 vv_group = app_commands.Group(name="vv", description="VOICEVOX設定")
