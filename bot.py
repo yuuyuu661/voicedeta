@@ -27,7 +27,7 @@ SHAKIPIYO_PARAMS = dict(
     postPhonemeLength=0.1,
 )
 
-# 起動時の通常値（素の声にしたい時はここを 1.0/0.0/1.0 に）
+# 起動時の通常値（素の声）
 DEFAULT_PARAMS = dict(
     speedScale=1.0,
     pitchScale=0.0,
@@ -49,6 +49,9 @@ tree = bot.tree
 # 再生キュー & タスク（ギルドごと）
 voice_queues: dict[int, asyncio.Queue[bytes]] = {}
 player_tasks: dict[int, asyncio.Task] = {}
+
+# VC接続レース防止ロック
+guild_connect_locks: dict[int, asyncio.Lock] = {}
 
 # 現在のTTS設定
 current_params = DEFAULT_PARAMS.copy()
@@ -167,53 +170,61 @@ async def ensure_player(vc: discord.VoiceClient):
     player_tasks[gid] = asyncio.create_task(_loop())
 
 
-# ========= 安全なVC接続（4006対策：移動優先・リトライ） =========
-async def safe_connect_to_user_channel(interaction: discord.Interaction, max_attempts: int = 3):
+# ========= 安全なVC接続（4006対策：ロック／移動優先／バックオフ） =========
+async def safe_connect_to_user_channel(interaction: discord.Interaction, max_attempts: int = 4):
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("先にVCへ入室してください。", ephemeral=True)
         return None
 
     target = interaction.user.voice.channel
-    vc = interaction.guild.voice_client
+    gid = interaction.guild.id
+    lock = guild_connect_locks.setdefault(gid, asyncio.Lock())
 
-    # 既に同じVC
-    if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(f"🔊 既に {target.mention} に接続済みです。", ephemeral=True)
-        return vc
+    async with lock:
+        vc = interaction.guild.voice_client
 
-    # 別VCにいるなら move_to を優先
-    if vc and vc.is_connected() and vc.channel and vc.channel.id != target.id:
-        try:
-            await vc.move_to(target)
+        # 既に同じVC
+        if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
             if not interaction.response.is_done():
-                await interaction.response.send_message(f"↪️ {target.mention} に移動しました。")
+                await interaction.response.send_message(f"🔊 既に {target.mention} に接続済みです。", ephemeral=True)
             return vc
-        except Exception:
+
+        # “接続中…”メッセージ（後で編集）
+        if interaction.response.is_done():
+            msg = await interaction.followup.send(f"⏳ {target.mention} に接続中…", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⏳ {target.mention} に接続中…", ephemeral=True)
+            msg = await interaction.original_response()
+
+        # 別VC→移動を優先
+        if vc and vc.is_connected() and vc.channel and vc.channel.id != target.id:
             try:
-                await vc.disconnect(force=True)
+                await vc.move_to(target)
+                await msg.edit(content=f"↪️ {target.mention} に移動しました。")
+                return vc
             except Exception:
-                pass
-            await asyncio.sleep(0.8)
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
 
-    # 新規接続（4006 などはリトライ）
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            vc = await target.connect(timeout=8.0, reconnect=False)
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"🔊 {target.mention} に接続しました。")
-            return vc
-        except (discord.errors.ConnectionClosed, asyncio.TimeoutError) as e:
-            last_err = e
-            await asyncio.sleep(1.5 * attempt)
-        except Exception as e:
-            last_err = e
-            break
+        # 新規接続（4006 対策：バックオフ）
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                vc = await target.connect(timeout=10.0, reconnect=False)
+                await msg.edit(content=f"🔊 {target.mention} に接続しました。")
+                return vc
+            except (discord.errors.ConnectionClosed, asyncio.TimeoutError) as e:
+                last_err = e
+                await asyncio.sleep(1.5 * attempt)
+            except Exception as e:
+                last_err = e
+                break
 
-    if not interaction.response.is_done():
-        await interaction.response.send_message(f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}", ephemeral=True)
-    return None
+        await msg.edit(content=f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}")
+        return None
 
 
 # ========= スラッシュコマンド =========
@@ -265,11 +276,27 @@ async def leave_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc:
         return await interaction.response.send_message("未接続です。", ephemeral=True)
+
+    gid = interaction.guild.id
+    try:
+        if gid in player_tasks and not player_tasks[gid].done():
+            player_tasks[gid].cancel()
+        if gid in voice_queues:
+            try:
+                while True:
+                    voice_queues[gid].get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        if vc.is_playing():
+            vc.stop()
+    except Exception:
+        pass
+
     try:
         await vc.disconnect(force=True)
     finally:
         await interaction.response.send_message("👋 切断しました。")
-        await asyncio.sleep(0.8)  # セッション解放猶予
+        await asyncio.sleep(1.0)  # セッション解放猶予
 
 
 @tree.command(name="say", description="テキストを読み上げます。")
