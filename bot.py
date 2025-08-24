@@ -8,8 +8,9 @@ from discord.ext import commands
 
 # ====== 環境変数 ======
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-VOICEVOX_URL = os.getenv("VOICEVOX_URL", "http://voicevox_engine.railway.internal:50021")
-# 高め・元気・やや早口の「しゃきぴよ風」初期値
+VOICEVOX_URL  = os.getenv("VOICEVOX_URL", "http://voicevox_engine.railway.internal:50021")
+
+# 高め・元気・やや早口（しゃきぴよ風）
 DEFAULT_PARAMS = dict(
     speedScale=1.15,
     pitchScale=0.60,
@@ -21,16 +22,16 @@ DEFAULT_PARAMS = dict(
 DEFAULT_SPEAKER_NAME = os.getenv("VV_SPEAKER_NAME", "春日部つむぎ")
 DEFAULT_STYLE_NAME   = os.getenv("VV_STYLE_NAME", "ノーマル")
 
-# 即時ギルド同期（カンマ区切りID）※未設定ならグローバル登録
+# 即時同期したいギルドID（カンマ区切り）。未設定ならグローバル同期。
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
 
 # ====== Bot 準備 ======
 intents = discord.Intents.default()
-intents.message_content = True  # なくても動くが一応ON
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# 再生キュー（VCごとに持つ）
+# 再生キュー（ギルドごと）
 voice_queues: dict[int, asyncio.Queue[bytes]] = {}
 player_tasks: dict[int, asyncio.Task] = {}
 
@@ -93,7 +94,7 @@ async def ensure_player(vc: discord.VoiceClient):
                 tmp = f"vv_{g_id}.wav"
                 with open(tmp, "wb") as f:
                     f.write(data)
-                # 24kHz mono wav → FFmpeg が 48kHz/stereo に変換
+                # VOICEVOX: 24kHz mono WAV → FFmpeg が48kHz/stereoへ変換
                 source = discord.FFmpegPCMAudio(tmp)
                 done_evt = asyncio.Event()
 
@@ -114,8 +115,7 @@ async def on_ready():
     try:
         if GUILD_IDS:
             for gid in GUILD_IDS:
-                guild = discord.Object(id=gid)
-                await tree.sync(guild=guild)
+                await tree.sync(guild=discord.Object(id=gid))
             print(f"Synced to guilds: {GUILD_IDS}")
         else:
             await tree.sync()
@@ -123,6 +123,14 @@ async def on_ready():
     except Exception as e:
         print("Sync error:", e)
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+# 管理者用：このサーバーに即時同期
+@tree.command(name="sync", description="コマンドをこのサーバーに即時同期（管理者専用）")
+async def sync_here(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("管理者のみ実行可です。", ephemeral=True)
+    await tree.sync(guild=interaction.guild)
+    await interaction.response.send_message("✅ このサーバーに同期しました。", ephemeral=True)
 
 # /join
 @tree.command(name="join", description="あなたのいるVCに参加します。")
@@ -159,7 +167,7 @@ async def say_cmd(interaction: discord.Interaction, text: str):
     await voice_queues[interaction.guild.id].put(audio)
     await interaction.followup.send("📣 キューに追加しました。", ephemeral=True)
 
-# /vv voice, /vv speed, /vv pitch, /vv intonation, /vv reset
+# VOICEVOX設定
 vv_group = app_commands.Group(name="vv", description="VOICEVOX設定")
 
 @vv_group.command(name="voice", description="話者/スタイルを切り替えます。例: 春日部つむぎ ノーマル")
@@ -198,7 +206,7 @@ async def credit_cmd(interaction: discord.Interaction):
         f"このBotは VOICEVOX:{current_speaker_name} の音声ライブラリを利用しています。"
     )
 
-# グループ追加
+# グループ登録
 tree.add_command(vv_group)
 
 # ====== 起動 ======
