@@ -66,29 +66,34 @@ async def synth_voicevox(text: str) -> bytes:
     async with _make_session() as session:
         spk_id = await resolve_speaker(session, current_speaker_name, current_style_name)
 
-        # audio_query
+        # ✅ audio_query: JSON で { "text": ... } を送る
         async with session.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"speaker": spk_id},
-            data=text.encode("utf-8"),
+            json={"text": text},                         # ← ここを data→json に変更
+            headers={"Accept": "application/json"},      # （任意）明示
         ) as r:
-            r.raise_for_status()
+            # デバッグしやすいように失敗時は本文を出す
+            if r.status >= 400:
+                body = await r.text()
+                raise RuntimeError(f"audio_query {r.status}: {body}")
             query = await r.json()
 
-        # パラメータ上書き
+        # しゃきぴよ風パラメータを上書き
         for k, v in current_params.items():
             query[k] = v
 
-        # synthesis
+        # synthesis は元のまま（JSONで送る）
         async with session.post(
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": spk_id},
             data=json.dumps(query),
             headers={"Content-Type": "application/json"},
         ) as r:
-            r.raise_for_status()
+            if r.status >= 400:
+                body = await r.text()
+                raise RuntimeError(f"synthesis {r.status}: {body}")
             return await r.read()  # wav bytes
-
 
 # ========= 再生ループ =========
 async def ensure_player(vc: discord.VoiceClient):
@@ -241,3 +246,4 @@ tree.add_command(vv_group)
 if not DISCORD_TOKEN:
     raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
 bot.run(DISCORD_TOKEN)
+
