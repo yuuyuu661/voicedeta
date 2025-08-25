@@ -9,8 +9,8 @@ from discord.ext import commands
 
 # ====== 環境変数 ======
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-# 公開URLなら https://xxx.up.railway.app （ポートなし）
-# Private DNS を使うなら http://<service>.railway.internal:50021
+# 公開URL: https://xxx.up.railway.app（ポートなし）
+# Private: http://<service>.railway.internal:50021（IPv6-onlyだと不可）
 VOICEVOX_URL = os.getenv("VOICEVOX_URL", "https://example.up.railway.app")
 
 # デフォルト話者・スタイル（必要に応じて Variables で上書き）
@@ -27,7 +27,7 @@ SHAKIPIYO_PARAMS = dict(
     postPhonemeLength=0.1,
 )
 
-# 起動時の通常値（素の声で開始したいのでこちら）
+# 起動時の通常値（素の声）
 DEFAULT_PARAMS = dict(
     speedScale=1.0,
     pitchScale=0.0,
@@ -43,6 +43,7 @@ GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.
 # ====== Bot 準備 ======
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True  # ← 重要：ボイス状態イベントを受け取る
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
@@ -59,10 +60,11 @@ current_speaker_name = DEFAULT_SPEAKER_NAME
 current_style_name   = DEFAULT_STYLE_NAME
 
 
-# ========= セッション（IPv4固定。Private DNS が IPv6-only なら公開URL https を推奨） =========
+# ========= セッション（IPv4固定） =========
+import socket as _socket
 def _make_session() -> aiohttp.ClientSession:
     return aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(family=socket.AF_INET)  # IPv4のみ
+        connector=aiohttp.TCPConnector(family=_socket.AF_INET)  # IPv4のみ
     )
 
 
@@ -82,8 +84,7 @@ async def synth_voicevox(text: str) -> bytes:
     async with _make_session() as session:
         spk_id = await resolve_speaker(session, current_speaker_name, current_style_name)
 
-        # --- audio_query ---
-        # 1st: 公式仕様（POST + クエリに text/speaker）
+        # audio_query（まず公式：POST + クエリ text/speaker）
         async with session.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"text": text, "speaker": spk_id},
@@ -92,8 +93,7 @@ async def synth_voicevox(text: str) -> bytes:
                 query = await r.json()
             else:
                 body = await r.text()
-                # 405/415/422 の場合のみ json ボディ方式でフォールバック
-                if r.status in (405, 415, 422):
+                if r.status in (405, 415, 422):  # フォールバック：JSONボディ
                     async with session.post(
                         f"{VOICEVOX_URL}/audio_query",
                         params={"speaker": spk_id},
@@ -107,11 +107,11 @@ async def synth_voicevox(text: str) -> bytes:
                 else:
                     raise RuntimeError(f"audio_query {r.status}: {body}")
 
-        # パラメータ反映（現在値）
+        # パラメータ反映
         for k, v in current_params.items():
             query[k] = v
 
-        # --- synthesis ---
+        # synthesis
         async with session.post(
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": spk_id},
@@ -122,6 +122,26 @@ async def synth_voicevox(text: str) -> bytes:
                 body = await r.text()
                 raise RuntimeError(f"synthesis {r.status}: {body}")
             return await r.read()  # wav bytes
+
+
+# ========= ギルド単位のクリーンリセット =========
+def reset_guild_audio(gid: int):
+    """再生タスク・キュー・一時状態を即リセット（音声パラメータ等は保持）"""
+    try:
+        if gid in player_tasks and not player_tasks[gid].done():
+            player_tasks[gid].cancel()
+    except Exception:
+        pass
+    try:
+        if gid in voice_queues:
+            q = voice_queues[gid]
+            try:
+                while True:
+                    q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+    except Exception:
+        pass
 
 
 # ========= 再生ループ（/tmp・Opus出力・クリーンアップ・競合回避） =========
@@ -223,7 +243,7 @@ async def safe_connect_to_user_channel(interaction: discord.Interaction, max_att
                 last_err = e
                 break
 
-        # 最終確認：実は接続できていないか
+        # 最終確認：実は接続できている？
         vc_now = interaction.guild.voice_client
         if vc_now and vc_now.is_connected():
             await msg.edit(content=f"🔊 {target.mention} に接続しました。")
@@ -231,6 +251,21 @@ async def safe_connect_to_user_channel(interaction: discord.Interaction, max_att
 
         await msg.edit(content=f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}")
         return None
+
+
+# ========= イベント：BotがVCから外れたら即リセット =========
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Bot本人のボイス状態のみ監視
+    if member.id != bot.user.id:
+        return
+
+    # VCから完全にいなくなった（切断/キック/タイムアウト等）
+    if before.channel and not after.channel:
+        gid = member.guild.id
+        reset_guild_audio(gid)
+        # ここでは自動再接続しない（別VCに即対応できるようクリーンな状態に保つ）
+        print(f"[cleanup] voice reset for guild {gid} (disconnected)")
 
 
 # ========= スラッシュコマンド =========
@@ -284,15 +319,9 @@ async def leave_cmd(interaction: discord.Interaction):
         return await interaction.response.send_message("未接続です。", ephemeral=True)
 
     gid = interaction.guild.id
+    # 再生停止＆状態リセット
+    reset_guild_audio(gid)
     try:
-        if gid in player_tasks and not player_tasks[gid].done():
-            player_tasks[gid].cancel()
-        if gid in voice_queues:
-            try:
-                while True:
-                    voice_queues[gid].get_nowait()
-            except asyncio.QueueEmpty:
-                pass
         if vc.is_playing():
             vc.stop()
     except Exception:
@@ -309,12 +338,16 @@ async def leave_cmd(interaction: discord.Interaction):
 @app_commands.describe(text="読み上げる内容")
 async def say_cmd(interaction: discord.Interaction, text: str):
     vc = interaction.guild.voice_client
+    # 未接続/切断済みなら、自動でユーザーのVCへ接続を試す
     if not vc or not vc.is_connected():
-        return await interaction.response.send_message("先に /join でVCに入れてください。", ephemeral=True)
+        vc = await safe_connect_to_user_channel(interaction)
+        if not vc:
+            return  # ここでメッセージはヘルパ側が出している
 
     await interaction.response.defer(thinking=True, ephemeral=True)
     audio = await synth_voicevox(text)
-    await voice_queues[interaction.guild.id].put(audio)
+    await voice_queues.setdefault(interaction.guild.id, asyncio.Queue()).put(audio)
+    await ensure_player(vc)
     await interaction.followup.send("📣 キューに追加しました。", ephemeral=True)
 
 
