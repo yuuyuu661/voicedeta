@@ -200,7 +200,6 @@ async def safe_connect_to_user_channel(
     gid = interaction.guild.id
     lock = guild_connect_locks.setdefault(gid, asyncio.Lock())
 
-    # “接続中…”メッセージを用意
     if status_msg is None:
         status_msg = await interaction.followup.send(f"⏳ {target.mention} に接続中…", ephemeral=True, wait=True)
 
@@ -225,21 +224,41 @@ async def safe_connect_to_user_channel(
                     pass
                 await asyncio.sleep(1.2)
 
-        # 新規接続（discord.py の自動再接続ON）
+        # 孤児化した vc が残っていたら先に壊す
+        if vc and not vc.is_connected():
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        # 新規接続（4006 は “完全切断→待機→再試行”）
         last_err = None
         for attempt in range(1, max_attempts + 1):
             try:
-                vc = await target.connect(timeout=10.0, reconnect=True)
+                # reconnect=False にして、失敗時は必ずこちらで制御
+                vc = await target.connect(timeout=12.0, reconnect=False, self_deaf=True, self_mute=False)
                 await status_msg.edit(content=f"🔊 {target.mention} に接続しました。")
                 return vc
-            except (discord.errors.ConnectionClosed, asyncio.TimeoutError) as e:
+            except discord.errors.ConnectionClosed as e:
+                last_err = e
+                # 4006: Invalid Session → 完全切断してからクールダウン
+                try:
+                    tmp_vc = interaction.guild.voice_client
+                    if tmp_vc:
+                        await tmp_vc.disconnect(force=True)
+                except Exception:
+                    pass
+                # バックオフ + ジッター
+                await asyncio.sleep(2.0 * attempt + (asyncio.get_event_loop().time() % 0.5))
+            except asyncio.TimeoutError as e:
                 last_err = e
                 await asyncio.sleep(1.5 * attempt)
             except Exception as e:
                 last_err = e
                 break
 
-        # 最終確認：実は接続できている？
+        # 最終確認：接続済みなら成功扱い
         vc_now = interaction.guild.voice_client
         if vc_now and vc_now.is_connected():
             await status_msg.edit(content=f"🔊 {target.mention} に接続しました。")
@@ -247,8 +266,6 @@ async def safe_connect_to_user_channel(
 
         await status_msg.edit(content=f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}")
         return None
-
-
 # ========= 切断検知：BotがVCから外れたら即リセット =========
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -393,3 +410,4 @@ async def credit_cmd(interaction: discord.Interaction):
 if not DISCORD_TOKEN:
     raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
 bot.run(DISCORD_TOKEN)
+
