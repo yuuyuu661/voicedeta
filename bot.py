@@ -27,7 +27,7 @@ SHAKIPIYO_PARAMS = dict(
     postPhonemeLength=0.1,
 )
 
-# 起動時の通常値（素の声）
+# 起動時の通常値（素の声で開始したいのでこちら）
 DEFAULT_PARAMS = dict(
     speedScale=1.0,
     pitchScale=0.0,
@@ -170,7 +170,7 @@ async def ensure_player(vc: discord.VoiceClient):
     player_tasks[gid] = asyncio.create_task(_loop())
 
 
-# ========= 安全なVC接続（4006対策：ロック／移動優先／バックオフ） =========
+# ========= 安全なVC接続（ロック／移動優先／reconnect=True／バックオフ／最終確認） =========
 async def safe_connect_to_user_channel(interaction: discord.Interaction, max_attempts: int = 4):
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("先にVCへ入室してください。", ephemeral=True)
@@ -189,7 +189,7 @@ async def safe_connect_to_user_channel(interaction: discord.Interaction, max_att
                 await interaction.response.send_message(f"🔊 既に {target.mention} に接続済みです。", ephemeral=True)
             return vc
 
-        # “接続中…”メッセージ（後で編集）
+        # “接続中…”（後で編集）
         if interaction.response.is_done():
             msg = await interaction.followup.send(f"⏳ {target.mention} に接続中…", ephemeral=True)
         else:
@@ -209,11 +209,11 @@ async def safe_connect_to_user_channel(interaction: discord.Interaction, max_att
                     pass
                 await asyncio.sleep(1.2)
 
-        # 新規接続（4006 対策：バックオフ）
+        # 新規接続（discord.py の自動再接続ON）
         last_err = None
         for attempt in range(1, max_attempts + 1):
             try:
-                vc = await target.connect(timeout=10.0, reconnect=False)
+                vc = await target.connect(timeout=10.0, reconnect=True)
                 await msg.edit(content=f"🔊 {target.mention} に接続しました。")
                 return vc
             except (discord.errors.ConnectionClosed, asyncio.TimeoutError) as e:
@@ -222,6 +222,12 @@ async def safe_connect_to_user_channel(interaction: discord.Interaction, max_att
             except Exception as e:
                 last_err = e
                 break
+
+        # 最終確認：実は接続できていないか
+        vc_now = interaction.guild.voice_client
+        if vc_now and vc_now.is_connected():
+            await msg.edit(content=f"🔊 {target.mention} に接続しました。")
+            return vc_now
 
         await msg.edit(content=f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}")
         return None
