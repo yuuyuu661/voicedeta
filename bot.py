@@ -9,8 +9,8 @@ from discord.ext import commands
 
 # ====== 環境変数 ======
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-# 公開URL: https://xxx.up.railway.app（ポートなし）
-# Private: http://<service>.railway.internal:50021（※IPv6-only環境は不可）
+# 公開URL: https://<engine>.up.railway.app（ポートなし/https）
+# Private:  http://voicevox_engine.railway.internal:50021（※IPv6-only環境は不可）
 VOICEVOX_URL = os.getenv("VOICEVOX_URL", "https://example.up.railway.app")
 
 # デフォルト話者・スタイル（Variablesで上書き可）
@@ -47,11 +47,11 @@ intents.voice_states = True  # 切断検知に必要
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# 再生キュー & タスク（ギルドごと）
+# ====== 再生・接続状態 ======
 voice_queues: dict[int, asyncio.Queue[bytes]] = {}
 player_tasks: dict[int, asyncio.Task] = {}
-# VC接続レース防止ロック
 guild_connect_locks: dict[int, asyncio.Lock] = {}
+disconnect_cleanup_tasks: dict[int, asyncio.Task] = {}
 
 # 現在のTTS設定
 current_params = DEFAULT_PARAMS.copy()
@@ -62,7 +62,7 @@ current_style_name   = DEFAULT_STYLE_NAME
 # ========= IPv4固定セッション =========
 def _make_session() -> aiohttp.ClientSession:
     return aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(family=_socket.AF_INET)  # IPv4のみ
+        connector=aiohttp.TCPConnector(family=_socket.AF_INET)
     )
 
 
@@ -91,7 +91,7 @@ async def synth_voicevox(text: str) -> bytes:
                 query = await r.json()
             else:
                 body = await r.text()
-                # フォールバック：JSONボディ（405/415/422 の時）
+                # フォールバック：JSONボディ（405/415/422）
                 if r.status in (405, 415, 422):
                     async with session.post(
                         f"{VOICEVOX_URL}/audio_query",
@@ -186,7 +186,21 @@ async def ensure_player(vc: discord.VoiceClient):
     player_tasks[gid] = asyncio.create_task(_loop())
 
 
-# ========= 安全なVC接続（defer/followup運用・ロック・reconnect・最終確認） =========
+# ========= 遅延クリーンアップ（切断→少し待って未接続ならリセット） =========
+async def _delayed_cleanup(gid: int, delay: float = 2.0):
+    try:
+        await asyncio.sleep(delay)
+        guild = bot.get_guild(gid)
+        vc = guild.voice_client if guild else None
+        if vc and vc.is_connected():
+            return  # もう再接続済み
+        reset_guild_audio(gid)
+        print(f"[cleanup] delayed voice reset for guild {gid} (still disconnected)")
+    except asyncio.CancelledError:
+        return
+
+
+# ========= 安全なVC接続（defer/followup運用・ロック・4006対策） =========
 async def safe_connect_to_user_channel(
     interaction: discord.Interaction,
     status_msg: discord.Message | None = None,
@@ -200,6 +214,7 @@ async def safe_connect_to_user_channel(
     gid = interaction.guild.id
     lock = guild_connect_locks.setdefault(gid, asyncio.Lock())
 
+    # “接続中…”メッセージを用意
     if status_msg is None:
         status_msg = await interaction.followup.send(f"⏳ {target.mention} に接続中…", ephemeral=True, wait=True)
 
@@ -224,7 +239,7 @@ async def safe_connect_to_user_channel(
                     pass
                 await asyncio.sleep(1.2)
 
-        # 孤児化した vc が残っていたら先に壊す
+        # 孤児化した vc が残っていたら壊す
         if vc and not vc.is_connected():
             try:
                 await vc.disconnect(force=True)
@@ -232,24 +247,23 @@ async def safe_connect_to_user_channel(
                 pass
             await asyncio.sleep(1.0)
 
-        # 新規接続（4006 は “完全切断→待機→再試行”）
+        # 新規接続：4006 は完全切断→クールダウン→再試行
         last_err = None
         for attempt in range(1, max_attempts + 1):
             try:
-                # reconnect=False にして、失敗時は必ずこちらで制御
+                # reconnect=False にして失敗は必ずこちらで制御
                 vc = await target.connect(timeout=12.0, reconnect=False, self_deaf=True, self_mute=False)
                 await status_msg.edit(content=f"🔊 {target.mention} に接続しました。")
                 return vc
             except discord.errors.ConnectionClosed as e:
                 last_err = e
-                # 4006: Invalid Session → 完全切断してからクールダウン
+                # 4006: Invalid Session → 完全切断してから待機
                 try:
                     tmp_vc = interaction.guild.voice_client
                     if tmp_vc:
                         await tmp_vc.disconnect(force=True)
                 except Exception:
                     pass
-                # バックオフ + ジッター
                 await asyncio.sleep(2.0 * attempt + (asyncio.get_event_loop().time() % 0.5))
             except asyncio.TimeoutError as e:
                 last_err = e
@@ -266,15 +280,28 @@ async def safe_connect_to_user_channel(
 
         await status_msg.edit(content=f"⚠️ 接続に失敗しました: {type(last_err).__name__} {last_err}")
         return None
-# ========= 切断検知：BotがVCから外れたら即リセット =========
+
+
+# ========= イベント：Botの入退室で遅延クリーンアップ制御 =========
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if bot.user and member.id != bot.user.id:
+    if not bot.user or member.id != bot.user.id:
         return
+    gid = member.guild.id
+
+    # 参加 → 保留中のクリーンアップをキャンセル
+    if after.channel and not before.channel:
+        task = disconnect_cleanup_tasks.pop(gid, None)
+        if task and not task.done():
+            task.cancel()
+        return
+
+    # 完全にいなくなった（切断）→ 遅延クリーンアップ
     if before.channel and not after.channel:
-        gid = member.guild.id
-        reset_guild_audio(gid)
-        print(f"[cleanup] voice reset for guild {gid} (disconnected)")
+        old = disconnect_cleanup_tasks.get(gid)
+        if old and not old.done():
+            old.cancel()
+        disconnect_cleanup_tasks[gid] = asyncio.create_task(_delayed_cleanup(gid, delay=2.0))
 
 
 # ========= スラッシュコマンド =========
@@ -316,9 +343,8 @@ async def sync_here(interaction: discord.Interaction):
 @tree.command(name="join", description="あなたのいるVCに参加します。")
 @app_commands.checks.bot_has_permissions(connect=True, speak=True)
 async def join_cmd(interaction: discord.Interaction):
-    # ★ Unknown interaction防止：即 defer
+    # Unknown interaction防止：先に defer
     await interaction.response.defer(ephemeral=True, thinking=True)
-    # ステータスメッセージを先に作り、以後は followup.edit
     status = await interaction.followup.send("⏳ 接続中…", ephemeral=True, wait=True)
     vc = await safe_connect_to_user_channel(interaction, status_msg=status)
     if vc:
@@ -350,7 +376,6 @@ async def leave_cmd(interaction: discord.Interaction):
 @tree.command(name="say", description="テキストを読み上げます。")
 @app_commands.describe(text="読み上げる内容")
 async def say_cmd(interaction: discord.Interaction, text: str):
-    # /say も最初に defer（TTSや接続で時間がかかるため）
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     vc = interaction.guild.voice_client
@@ -410,4 +435,3 @@ async def credit_cmd(interaction: discord.Interaction):
 if not DISCORD_TOKEN:
     raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。")
 bot.run(DISCORD_TOKEN)
-
